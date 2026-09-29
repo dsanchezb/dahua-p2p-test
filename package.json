@@ -1,0 +1,19 @@
+{
+  "name": "dahua-p2p-live-viewer",
+  "version": "0.1.0",
+  "description": "Web app to view Dahua/derived P2P cameras live in the browser using only device serial + username/password (via the Dahua P2P/PTCP protocol, ffmpeg RTSP->HLS transcode, and hls.js playback).",
+  "private": true,
+  "type": "commonjs",
+  "main": "server/index.js",
+  "scripts": {
+    "build:dhp2p": "bash scripts/build-dh-p2p.sh",
+    "start": "node server/index.js",
+    "dev": "node server/index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

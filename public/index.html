@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Dahua P2P Live Viewer</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Dahua P2P Live Viewer</h1>
+    <p class="subtitle">
+      View a Dahua / derived (NVR or camera) live feed in the browser using only its
+      <strong>device serial (P2P ID / SN)</strong> and <strong>username / password</strong> &mdash;
+      no port forwarding required. Built on the
+      <a href="https://github.com/khoanguyen-3fc/dh-p2p" target="_blank" rel="noopener">dh-p2p</a>
+      P2P/PTCP tunnel implementation.
+    </p>
+  </header>
+
+  <main>
+    <section class="panel form-panel">
+      <h2>Connect</h2>
+      <form id="connect-form">
+        <label>
+          Device Serial (SN)
+          <input type="text" id="serial" name="serial" placeholder="e.g. 5H0989EPAZEB886" required autocomplete="off" />
+        </label>
+        <label>
+          Username
+          <input type="text" id="username" name="username" placeholder="admin" required autocomplete="off" />
+        </label>
+        <label>
+          Password
+          <input type="password" id="password" name="password" placeholder="••••••••" required autocomplete="off" />
+        </label>
+        <div class="row">
+          <label>
+            Channel
+            <input type="number" id="channel" name="channel" value="1" min="1" />
+          </label>
+          <label>
+            Subtype
+            <select id="subtype" name="subtype">
+              <option value="0">0 (main stream)</option>
+              <option value="1">1 (sub stream)</option>
+            </select>
+          </label>
+        </div>
+        <button type="submit" id="connect-btn">Connect</button>
+        <button type="button" id="disconnect-btn" disabled>Disconnect</button>
+      </form>
+      <p class="hint">
+        Credentials are only used to establish the P2P tunnel and RTSP session for this
+        browser tab; they are held in server memory for the lifetime of the session and
+        are not persisted to disk.
+      </p>
+    </section>
+
+    <section class="panel video-panel">
+      <h2>Live Feed</h2>
+      <video id="video" controls autoplay muted playsinline></video>
+      <div id="status" class="status status-idle">Not connected</div>
+    </section>
+
+    <section class="panel log-panel">
+      <h2>Session Log</h2>
+      <pre id="log"></pre>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      PoC only. The underlying <code>dh-p2p</code> protocol tunnel is unofficial,
+      reverse-engineered, and can be unstable — see the
+      <a href="https://github.com/khoanguyen-3fc/dh-p2p#limitations" target="_blank" rel="noopener">upstream limitations</a>.
+    </p>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
