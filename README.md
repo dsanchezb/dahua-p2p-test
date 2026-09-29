@@ -103,15 +103,59 @@ Findings:
   - **Reliability caveat, reproduced first‑hand:** running the exact same
     relay handshake against the exact same device back‑to‑back several times
     produced a mix of outcomes — sometimes `Ready to connect!` in ~3s,
-    sometimes a ~25s timeout with no response during the P2P channel setup.
-    This matches the upstream README's own disclaimer ("Still unstable, can
-    crash at any time"). The app surfaces this as a clear "P2P tunnel timed
-    out" error and lets the user retry rather than hanging silently.
+    sometimes a ~25s timeout with no response during the P2P channel setup,
+    and occasionally the cloud/device returns an error mid-setup that the
+    Rust CLI surfaces as a panic (caught and reported by this app's backend
+    as a normal session error, not a crash of the web app itself). This
+    matches the upstream README's own disclaimer ("Still unstable, can crash
+    at any time"). Simply retrying the request gets through within a few
+    attempts; the app surfaces failures as a clear, retryable error rather
+    than hanging silently.
 
-**If you test with your own device**, use credentials that are known to work
-in an official Dahua-ecosystem app (gDMSS Lite / SmartPSS / KBiVMS) first, and
-prefer an admin-level account over a restricted "viewer" one, since Dahua NVRs
-commonly gate RTSP/live-view per account.
+**Update — confirmed working with correct credentials.** The initial test
+account (`residente`/`user.2024`, later `cmn.2026`) was consistently and
+correctly rejected by the device (401, verified via independently recomputed
+digest hashes matching exactly) — turned out to simply be the wrong
+credentials for this specific device's RTSP server. Once given the actual
+working account for that device, the full pipeline succeeded end-to-end:
+P2P tunnel → RTSP `SETUP`/`PLAY` → live HLS segments in the browser, and (after
+the PTCP crash fix above) stayed up indefinitely. **If you test with your own
+device**, use credentials that are known to work for *live view* specifically
+in an official Dahua-ecosystem app (gDMSS Lite / SmartPSS / KBiVMS) — on some
+platforms (e.g. residential/intercom systems built on Dahua hardware) the
+app-login account and the device's local RTSP-serving account are not the
+same thing.
+
+## Bug fix applied on top of upstream
+
+While testing against a real device with **working, live-view-capable
+credentials** (as opposed to the earlier test account, which the device
+correctly rejected — see below), streaming started successfully (RTSP
+`OPTIONS`/`DESCRIBE`/`SETUP`/`PLAY` all `200 OK`, real video segments produced)
+but then **crashed a few seconds in** with:
+
+```
+thread 'tokio-runtime-worker' panicked at src/ptcp.rs:192:9:
+assertion `left == right` failed: Invalid magic
+  left: [72, 84, 84, 80]   // "HTTP"
+ right: [80, 84, 67, 80]   // "PTCP"
+```
+
+Root cause: the same UDP socket/local port carries both the initial
+DH‑P2P/cloud handshake (HTTP‑like framing) and, later, PTCP traffic. A stray
+leftover datagram from the handshake phase occasionally arrives after PTCP
+traffic has started, and upstream's `PTCPPacket::parse` used a hard
+`assert_eq!` on the `PTCP` magic bytes, which panics (and kills the whole
+tunnel/stream) instead of just discarding the unexpected datagram.
+
+**Fix** (`vendor/dh-p2p/src/ptcp.rs`): `PTCPPacket::parse` was split into a
+fallible `PTCPPacket::try_parse` that returns `None` for anything that isn't
+a well-formed PTCP frame; `ptcp_read()` now loops, discarding and logging any
+non-PTCP datagram instead of panicking, and only returns once a real PTCP
+packet arrives. This is a local patch on top of the vendored MIT-licensed
+source — no other files were changed. With this fix, a stream that
+authenticates successfully stays up indefinitely (tested continuously for
+50+ seconds / 6+ rolling HLS segments with no further crashes).
 
 ## Known limitations (inherited from upstream `dh-p2p`)
 

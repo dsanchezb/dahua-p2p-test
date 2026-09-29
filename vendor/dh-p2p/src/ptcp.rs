@@ -184,12 +184,22 @@ impl PTCPBody {
 }
 
 impl PTCPPacket {
-    fn parse(data: &[u8]) -> PTCPPacket {
-        assert!(data.len() >= 24, "Invalid packet");
+    /// Parses a PTCP packet, returning `None` for anything that isn't a
+    /// well-formed PTCP frame (wrong magic, too short, malformed body)
+    /// instead of panicking. The same UDP socket that carries PTCP traffic
+    /// can, in practice, occasionally receive a stray leftover datagram from
+    /// the earlier DH-P2P/cloud handshake (which uses an HTTP-like framing on
+    /// the same local port); treating those as a fatal error crashes an
+    /// otherwise healthy stream, so the caller discards and keeps reading.
+    fn try_parse(data: &[u8]) -> Option<PTCPPacket> {
+        if data.len() < 24 {
+            return None;
+        }
 
         let magic = &data[0..4];
-
-        assert_eq!(magic, b"PTCP", "Invalid magic");
+        if magic != b"PTCP" {
+            return None;
+        }
 
         let sent = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         let recv = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
@@ -198,14 +208,14 @@ impl PTCPPacket {
         let rmid = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
         let body = PTCPBody::parse(&data[24..]);
 
-        PTCPPacket {
+        Some(PTCPPacket {
             sent,
             recv,
             pid,
             lmid,
             rmid,
             body,
-        }
+        })
     }
 
     fn serialize(&self) -> Vec<u8> {
@@ -308,17 +318,34 @@ impl PTCP for UdpSocket {
     }
 
     async fn ptcp_read(&self) -> PTCPPacket {
-        println!("### {}", self.peer_addr().unwrap());
+        loop {
+            println!("### {}", self.peer_addr().unwrap());
 
-        let mut buf = [0u8; 4096];
-        let n = self.recv(&mut buf).await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = self.recv(&mut buf).await.unwrap();
 
-        println!("<<< {}", self.peer_addr().unwrap());
-        let packet = PTCPPacket::parse(&buf[0..n]);
-        println!("{:?}", packet);
-        packet.try_print_data();
-        println!("---");
+            let packet = match PTCPPacket::try_parse(&buf[0..n]) {
+                Some(packet) => packet,
+                None => {
+                    // Not a PTCP frame (e.g. a stray leftover datagram from the
+                    // DH-P2P/cloud handshake sharing this socket/port). Log and
+                    // keep waiting for the next datagram instead of tearing
+                    // down an otherwise healthy stream.
+                    println!(
+                        "!!! discarding non-PTCP datagram ({} bytes) from {}",
+                        n,
+                        self.peer_addr().unwrap()
+                    );
+                    continue;
+                }
+            };
 
-        packet
+            println!("<<< {}", self.peer_addr().unwrap());
+            println!("{:?}", packet);
+            packet.try_print_data();
+            println!("---");
+
+            return packet;
+        }
     }
 }
