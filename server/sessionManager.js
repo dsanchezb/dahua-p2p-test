@@ -92,6 +92,10 @@ function startDhP2p(session) {
 
     const proc = spawn(DH_P2P_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     session.dhProc = proc;
+    if (process.env.DHP2P_DEBUG) {
+      // eslint-disable-next-line no-console
+      console.error(`[debug] spawned dh-p2p pid=${proc.pid} args=${JSON.stringify(args)}`);
+    }
 
     let settled = false;
     const timer = setTimeout(() => {
@@ -106,6 +110,10 @@ function startDhP2p(session) {
       for (const line of text.split(/\r?\n/)) {
         if (!line) continue;
         session.appendLog(source, line);
+        if (process.env.DHP2P_DEBUG) {
+          // eslint-disable-next-line no-console
+          console.error(`[debug:${source}] ${line}`);
+        }
 
         if (!settled) {
           if (line.includes(READY_MARKER)) {
