@@ -124,10 +124,24 @@ function startDhP2pTunnel({ serial, cloud, rtspPort, onLog = () => {}, readyTime
   return { proc, ready };
 }
 
-function stopDhP2pTunnel(proc) {
-  if (proc && !proc.killed) {
-    proc.kill('SIGTERM');
-  }
+/**
+ * Sends SIGTERM, then escalates to SIGKILL after a grace period if the
+ * process is still alive — a plain SIGTERM is not guaranteed to be acted on
+ * promptly (or at all) by every process state, and a stuck dh-p2p process
+ * left running is exactly the kind of leak that would otherwise go
+ * unnoticed (it holds no listening port once past its own startup).
+ */
+function stopDhP2pTunnel(proc, graceMs = 2000) {
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
+  proc.kill('SIGTERM');
+  const timer = setTimeout(() => {
+    if (proc.exitCode === null && proc.signalCode === null) {
+      try { proc.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+  }, graceMs);
+  // Don't let this timer keep the event loop alive on its own if everything
+  // else has already shut down (e.g. during process exit cleanup).
+  if (typeof timer.unref === 'function') timer.unref();
 }
 
 module.exports = {

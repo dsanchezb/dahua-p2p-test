@@ -3,16 +3,14 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const crypto = require('crypto');
 
 const { findFreePort } = require('./ports');
 const { startDhP2pTunnel, stopDhP2pTunnel } = require('./dhTunnel');
 const { buildRtspUrl } = require('./rtsp');
+const { ensureDataDir } = require('./dataDir');
 
-const HLS_ROOT = path.join(os.tmpdir(), 'dahua-p2p-hls');
-
-fs.mkdirSync(HLS_ROOT, { recursive: true });
+const HLS_ROOT = ensureDataDir('hls');
 
 /** @type {Map<string, Session>} */
 const sessions = new Map();

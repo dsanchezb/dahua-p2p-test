@@ -401,4 +401,403 @@
     form.scrollIntoView({ behavior: 'smooth', block: 'start' });
     form.requestSubmit();
   });
+
+  // --- Continuous (loop) recording ---------------------------------------
+
+  const recordForm = document.getElementById('record-form');
+  const recordStartBtn = document.getElementById('record-start-btn');
+  const recordingsListEl = document.getElementById('recordings-list');
+
+  const playbackPanel = document.getElementById('playback-panel');
+  const playbackTitle = document.getElementById('playback-title');
+  const playbackVideo = document.getElementById('playback-video');
+  const timelineEl = document.getElementById('timeline');
+  const timelinePlayedEl = document.getElementById('timeline-played');
+  const timelineGapsEl = document.getElementById('timeline-gaps');
+  const timelineCursorEl = document.getElementById('timeline-cursor');
+  const timelineStartLabel = document.getElementById('timeline-start-label');
+  const timelineEndLabel = document.getElementById('timeline-end-label');
+
+  // Known recording ids this tab has seen, so periodic refreshes can tell
+  // "new recording appeared" apart from "existing one updated" without
+  // re-fetching the full list structure every poll.
+  let recordingsPollTimer = null;
+  let playbackHls = null;
+  let playbackRecorder = null; // the recording object currently loaded in the player
+
+  // The HLS VOD playlist concatenates segments back-to-back with no actual
+  // gap in player time (an EXT-X-DISCONTINUITY doesn't add duration) — only
+  // the *wall-clock* timestamps have gaps where the tunnel dropped. So the
+  // timeline is built from the segment list's actual durations, not from
+  // oldestMs..newestEndMs, and gaps are shown as thin markers at the right
+  // *content-time* offset rather than stretched proportionally to how long
+  // the gap lasted in the real world.
+  let playbackTotalDuration = 0; // sum of segment durations, in seconds
+  let playbackGapOffsets = []; // [{ offsetSec, fromMs, toMs }]
+
+  function formatBytes(n) {
+    if (n == null || !Number.isFinite(n)) return '—';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    let v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+  }
+
+  function formatDuration(totalSeconds) {
+    if (totalSeconds == null || !Number.isFinite(totalSeconds)) return '—';
+    const s = Math.floor(totalSeconds);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${sec}s`;
+    return `${sec}s`;
+  }
+
+  function formatClock(ms) {
+    if (ms == null) return '—';
+    const d = new Date(ms);
+    return d.toLocaleString(undefined, {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+  }
+
+  function recordingStatusLabel(rec) {
+    switch (rec.status) {
+      case 'starting': return 'Starting…';
+      case 'recording': return 'Recording';
+      case 'reconnecting': return 'Reconnecting…';
+      case 'stopped': return 'Stopped';
+      case 'error': return 'Error';
+      default: return rec.status;
+    }
+  }
+
+  function renderRecordingCard(rec) {
+    let card = recordingsListEl.querySelector(`[data-recording-id="${rec.id}"]`);
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'recording-card';
+      card.dataset.recordingId = rec.id;
+      recordingsListEl.prepend(card);
+    }
+
+    card.className = `recording-card is-${rec.status}`;
+
+    const usedPct = rec.quotaBytes > 0 ? Math.min(100, (rec.usedBytes / rec.quotaBytes) * 100) : 0;
+    const nearFull = usedPct >= 90;
+
+    const canResume = rec.status === 'stopped';
+    const canStop = rec.status === 'recording' || rec.status === 'reconnecting' || rec.status === 'starting';
+    const canWatch = Boolean(rec.playlistUrl);
+
+    card.innerHTML = `
+      <div class="recording-card-head">
+        <div class="recording-card-title">
+          <span class="rec-dot"></span>
+          Ch ${rec.channel} / sub ${rec.subtype} &mdash; ${recordingStatusLabel(rec)}
+        </div>
+        <div class="recording-card-actions">
+          ${canWatch ? `<button type="button" data-action="watch">Watch</button>` : ''}
+          ${canStop ? `<button type="button" data-action="stop">Stop</button>` : ''}
+          ${canResume ? `<button type="button" data-action="resume">Resume</button>` : ''}
+          <button type="button" class="btn-danger" data-action="delete">Delete</button>
+        </div>
+      </div>
+      <div class="recording-stats">
+        <span>Retained: <strong>${formatDuration(rec.retainedSeconds)}</strong></span>
+        <span>Space used: <strong>${formatBytes(rec.usedBytes)}</strong> / ${formatBytes(rec.quotaBytes)}</span>
+        <span>Remaining: <strong>${formatBytes(rec.remainingBytes)}</strong></span>
+        <span>Segments: <strong>${rec.segmentCount}</strong></span>
+        <span>Since: <strong>${formatClock(rec.oldestMs)}</strong></span>
+      </div>
+      <div class="recording-space-bar">
+        <div class="recording-space-bar-fill${nearFull ? ' is-near-full' : ''}" style="width:${usedPct.toFixed(1)}%"></div>
+      </div>
+      ${rec.error ? `<div class="recording-error">${rec.error}</div>` : ''}
+    `;
+
+    card.dataset.serial = rec.serial;
+  }
+
+  async function refreshRecordings() {
+    try {
+      const res = await fetch('/api/recordings');
+      if (!res.ok) return;
+      const data = await res.json();
+
+      const seenIds = new Set();
+      for (const rec of data.recordings) {
+        seenIds.add(rec.id);
+        renderRecordingCard(rec);
+      }
+
+      // Drop cards for recordings that were deleted elsewhere (e.g. another
+      // tab, or server restart losing an entry that was never persisted).
+      for (const card of Array.from(recordingsListEl.children)) {
+        if (!seenIds.has(card.dataset.recordingId)) card.remove();
+      }
+
+      if (playbackRecorder && seenIds.has(playbackRecorder.id)) {
+        const updated = data.recordings.find((r) => r.id === playbackRecorder.id);
+        if (updated) playbackRecorder = updated;
+        // Note: deliberately not refreshing the loaded playlist/timeline
+        // markers here while the player is open — doing so mid-scrub would
+        // yank the playhead out from under the user. Re-opening via Watch
+        // picks up new segments/gaps.
+      }
+    } catch {
+      /* ignore transient errors */
+    }
+  }
+
+  function startRecordingsPolling() {
+    if (recordingsPollTimer) return;
+    recordingsPollTimer = setInterval(refreshRecordings, 4000);
+  }
+
+  recordForm.addEventListener('submit', async (evt) => {
+    evt.preventDefault();
+
+    const { serial, username, password } = currentCredentials();
+    if (!serial || !username || !password) {
+      alert('Fill in Device Serial, Username and Password in the Connect panel above first.');
+      return;
+    }
+
+    const payload = {
+      serial,
+      username,
+      password,
+      channel: document.getElementById('record-channel').value || '1',
+      subtype: document.getElementById('record-subtype').value || '0',
+      quotaGb: document.getElementById('record-quota').value || '1',
+      segmentSeconds: document.getElementById('record-segment-seconds').value || '60',
+    };
+
+    recordStartBtn.disabled = true;
+    try {
+      const res = await fetch('/api/recordings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(`Could not start recording: ${data.error || 'unknown error'}`);
+      } else {
+        renderRecordingCard(data);
+        startRecordingsPolling();
+      }
+    } catch (err) {
+      alert(`Request failed: ${err.message}`);
+    } finally {
+      recordStartBtn.disabled = false;
+    }
+  });
+
+  recordingsListEl.addEventListener('click', async (evt) => {
+    const btn = evt.target.closest('button[data-action]');
+    if (!btn) return;
+    const card = btn.closest('.recording-card');
+    const id = card?.dataset.recordingId;
+    if (!id) return;
+
+    const action = btn.dataset.action;
+
+    if (action === 'watch') {
+      openPlayback(id);
+      return;
+    }
+
+    if (action === 'stop') {
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/recordings/${id}/stop`, { method: 'POST' });
+        if (res.ok) renderRecordingCard(await res.json());
+      } finally {
+        btn.disabled = false;
+      }
+      return;
+    }
+
+    if (action === 'resume') {
+      const { username, password } = currentCredentials();
+      if (!username || !password) {
+        alert('Enter the Username and Password in the Connect panel above, then click Resume again.');
+        return;
+      }
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/recordings/${id}/resume`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(`Could not resume: ${data.error || 'unknown error'}`);
+        } else {
+          renderRecordingCard(data);
+          startRecordingsPolling();
+        }
+      } finally {
+        btn.disabled = false;
+      }
+      return;
+    }
+
+    if (action === 'delete') {
+      if (!confirm('Delete this recording and all its footage? This cannot be undone.')) return;
+      btn.disabled = true;
+      try {
+        await fetch(`/api/recordings/${id}`, { method: 'DELETE' });
+        card.remove();
+        if (playbackRecorder && playbackRecorder.id === id) {
+          closePlayback();
+        }
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  });
+
+  /**
+   * Recomputes playbackTotalDuration / playbackGapOffsets from the
+   * recording's actual segment list (actual durations, not wall-clock
+   * span), so timeline positions correspond 1:1 with the HLS player's own
+   * (gapless) timeline.
+   */
+  async function loadTimelineFromSegments(id) {
+    const res = await fetch(`/api/recordings/${id}/segments`);
+    if (!res.ok) return { totalDuration: 0, gaps: [] };
+    const data = await res.json();
+
+    let offset = 0;
+    let prevEndMs = null;
+    const gaps = [];
+
+    for (const seg of data.segments) {
+      if (prevEndMs !== null && seg.startMs - prevEndMs > 2000) {
+        gaps.push({ offsetSec: offset, fromMs: prevEndMs, toMs: seg.startMs });
+      }
+      offset += seg.durationSec;
+      prevEndMs = seg.startMs + seg.durationSec * 1000;
+    }
+
+    return { totalDuration: offset, gaps };
+  }
+
+  function renderTimelineGaps() {
+    timelineGapsEl.innerHTML = '';
+    if (playbackTotalDuration <= 0) return;
+
+    for (const gap of playbackGapOffsets) {
+      const left = (gap.offsetSec / playbackTotalDuration) * 100;
+      const marker = document.createElement('div');
+      marker.className = 'timeline-gap-marker';
+      marker.style.left = `${left}%`;
+      marker.style.width = '2px';
+      marker.title = `Recording gap: ${formatClock(gap.fromMs)} \u2192 ${formatClock(gap.toMs)}`;
+      timelineGapsEl.appendChild(marker);
+    }
+  }
+
+  function updateTimelineCursor() {
+    const duration = playbackTotalDuration || playbackVideo.duration;
+    if (!duration || !Number.isFinite(duration) || duration <= 0) return;
+
+    const pct = Math.min(100, Math.max(0, (playbackVideo.currentTime / duration) * 100));
+    timelineCursorEl.hidden = false;
+    timelineCursorEl.style.left = `${pct}%`;
+    timelinePlayedEl.style.width = `${pct}%`;
+  }
+
+  async function openPlayback(id) {
+    try {
+      const res = await fetch(`/api/recordings/${id}`);
+      if (!res.ok) {
+        alert('Could not load this recording.');
+        return;
+      }
+      const rec = await res.json();
+      if (!rec.playlistUrl) {
+        alert('This recording has no footage yet.');
+        return;
+      }
+
+      const { totalDuration, gaps } = await loadTimelineFromSegments(id);
+      playbackTotalDuration = totalDuration;
+      playbackGapOffsets = gaps;
+
+      playbackRecorder = rec;
+      playbackPanel.hidden = false;
+      playbackTitle.textContent = `Playback — Channel ${rec.channel} / sub ${rec.subtype} (${formatDuration(rec.retainedSeconds)} retained)`;
+      timelineStartLabel.textContent = formatClock(rec.oldestMs);
+      timelineEndLabel.textContent = formatClock(rec.newestEndMs);
+      renderTimelineGaps();
+      timelinePlayedEl.style.width = '0%';
+      timelineCursorEl.hidden = true;
+
+      if (playbackHls) {
+        playbackHls.destroy();
+        playbackHls = null;
+      }
+
+      const playlistUrl = `${rec.playlistUrl}?t=${Date.now()}`; // bust any caching mid-recording
+
+      if (window.Hls && window.Hls.isSupported()) {
+        playbackHls = new window.Hls();
+        playbackHls.loadSource(playlistUrl);
+        playbackHls.attachMedia(playbackVideo);
+      } else if (playbackVideo.canPlayType('application/vnd.apple.mpegurl')) {
+        playbackVideo.src = playlistUrl;
+      } else {
+        alert('This browser cannot play HLS and hls.js failed to load.');
+        return;
+      }
+
+      playbackPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (err) {
+      alert(`Failed to open playback: ${err.message}`);
+    }
+  }
+
+  function closePlayback() {
+    if (playbackHls) {
+      playbackHls.destroy();
+      playbackHls = null;
+    }
+    playbackVideo.pause();
+    playbackVideo.removeAttribute('src');
+    playbackVideo.load();
+    playbackPanel.hidden = true;
+    playbackRecorder = null;
+    playbackTotalDuration = 0;
+    playbackGapOffsets = [];
+  }
+
+  playbackVideo.addEventListener('timeupdate', updateTimelineCursor);
+
+  timelineEl.addEventListener('click', (evt) => {
+    const duration = playbackVideo.duration;
+    if (!playbackRecorder || !duration || !Number.isFinite(duration)) return;
+    const rect = timelineEl.getBoundingClientRect();
+    const pct = Math.min(1, Math.max(0, (evt.clientX - rect.left) / rect.width));
+
+    // The timeline's 0-100% maps directly onto the player's own (gapless)
+    // duration — see loadTimelineFromSegments — so clicking anywhere always
+    // lands on real, playable content.
+    playbackVideo.currentTime = pct * duration;
+    playbackVideo.play().catch(() => {});
+  });
+
+  // Pick up any recordings already running on the server (e.g. started in
+  // an earlier browser session, or before a page refresh) as soon as the
+  // page loads, since recording is designed to keep going in the
+  // background independent of the browser.
+  refreshRecordings().then(() => {
+    if (recordingsListEl.children.length > 0) startRecordingsPolling();
+  });
 })();

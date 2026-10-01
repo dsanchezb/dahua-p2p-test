@@ -1,0 +1,27 @@
+[Unit]
+Description=Dahua P2P Live Viewer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dahua-p2p-test
+ExecStart=/usr/bin/node server/index.js
+Environment=PORT=80
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+User=root
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# server/dataDir.js resolves its working directory to <app>/var by default
+# (overridable via DATA_DIR) specifically so it lands on the real host disk
+# rather than inside PrivateTmp's private, size-limited /tmp mount above —
+# see the "Continuous (loop) recording" section of the README for why that
+# distinction matters for this app's disk-space accounting. Whatever path
+# DATA_DIR resolves to (if overridden) must also be added here.
+ReadWritePaths=/tmp /opt/dahua-p2p-test/var
+
+[Install]
+WantedBy=multi-user.target

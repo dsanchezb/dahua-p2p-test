@@ -3,14 +3,14 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const crypto = require('crypto');
 
 const { findFreePort } = require('./ports');
 const { startDhP2pTunnel, stopDhP2pTunnel } = require('./dhTunnel');
 const { buildRtspUrl } = require('./rtsp');
+const { ensureDataDir } = require('./dataDir');
 
-const THUMB_ROOT = path.join(os.tmpdir(), 'dahua-p2p-thumbnails');
+const THUMB_ROOT = ensureDataDir('thumbnails');
 
 // Subtypes probed per channel. 0 = main/HD stream, 1 = sub/lower-bitrate
 // stream — most Dahua devices expose both per channel, but some only expose

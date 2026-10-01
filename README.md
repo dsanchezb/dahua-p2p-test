@@ -207,31 +207,123 @@ one RTSP connection attempt didn't land, not because the channel doesn't
 exist. Re-running the scan is the simplest way to confirm a channel marked
 unavailable is actually unavailable.
 
+## Continuous (loop) recording
+
+The **"Continuous (Loop) Recording"** panel records a channel/stream to disk
+indefinitely, independent of the browser:
+
+1. Pick a channel/subtype, how much disk space to allow (default 1 GB), and
+   the segment length (default 60s), then click **Start Recording**. This
+   brings up its own dedicated P2P/PTCP tunnel (separate from live view and
+   channel discovery) and starts `ffmpeg` writing fixed-length `.ts`
+   segments to disk (`-f segment`, `-strftime 1`, so each file's name
+   encodes its own wall-clock start time).
+2. As each segment finishes, it's added to the recording's manifest; once
+   total size exceeds the configured quota (or the host disk is running
+   low, independent of the quota), the **oldest segment is deleted** to make
+   room — true loop recording.
+3. The recording keeps running entirely on the server. The browser only
+   polls `GET /api/recordings` every few seconds to update the displayed
+   stats (space used/remaining, retained duration, segment count) — closing
+   the tab, refreshing the page, or not having it open at all **does not
+   stop or affect the recording in progress**. This was verified directly:
+   watching `retainedSeconds` advance by exactly 30s during a 30-second
+   window with zero HTTP requests made, confirming the recording process
+   advances purely server-side.
+4. Click **Watch** on any recording to open it in a player below, with a
+   custom timeline bar under the video. The timeline spans the recording's
+   actual (gapless) content duration; **click anywhere on it to jump
+   playback to that point**. If the tunnel ever dropped and reconnected
+   mid-recording, that's shown as a dashed marker on the timeline and an
+   `EXT-X-DISCONTINUITY` in the underlying HLS VOD playlist, but doesn't
+   create a seek-to-nothing dead zone — the player's timeline only ever
+   spans real, playable segments.
+5. **Stop**/**Resume**: stopping keeps all footage and the manifest;
+   resuming starts a new tunnel/ffmpeg attempt and simply continues
+   appending (the stopped interval shows up as a gap, same as an
+   unintentional tunnel drop). If the dh-p2p tunnel or ffmpeg dies
+   unexpectedly while "recording" (not explicitly stopped), the recorder
+   auto-reconnects every 5s rather than giving up.
+6. Recordings (their manifest + already-captured segments) **survive a
+   server restart**: on startup, any recording directories on disk are
+   reloaded as `status: "stopped"`. Device credentials are never written to
+   disk (consistent with the rest of this app), so resuming a
+   restart-recovered recording requires re-entering the username/password
+   via `POST /api/recordings/:id/resume`.
+
+Tested end-to-end against the real device: recordings reliably accumulate
+real `.ts` segments (manually verified to be well-formed MPEG-TS, with
+correct 188-byte-aligned `0x47` sync bytes throughout and real captured
+footage, not placeholder/black frames), quota enforcement was verified in
+isolation with real files (deletes oldest-first until back under quota),
+stop → resume correctly produces a timeline gap with the right
+`EXT-X-DISCONTINUITY` placement, and the manifest/segments correctly survive
+a `systemctl restart` of the whole app.
+
+Two bugs were found and fixed during this testing (both only in
+`server/recorder.js`, not in the pre-existing `sessionManager.js`/
+`channelScan.js` which already handled these correctly):
+
+- **Disk space was being measured on the wrong filesystem.** This app's own
+  systemd unit sets `PrivateTmp=true` for sandboxing, which gives the
+  process a private, tmpfs-backed `/tmp` disconnected from the real host
+  disk — `os.tmpdir()` (used for all of this app's working directories)
+  resolved into that tiny private mount, so "remaining space" and the
+  safety-margin check were being computed against a few hundred MB of
+  private tmpfs instead of the actual multi-GB disk. Fixed by adding
+  `server/dataDir.js`, which resolves a real on-disk directory (under the
+  app's own install path, `DATA_DIR`-overridable) instead of `os.tmpdir()`,
+  with a startup write-check that logs clearly if it ever falls back. The
+  systemd unit's `ReadWritePaths` was updated to include this directory.
+- **A failed/cancelled recording attempt could leak its `dh-p2p` process.**
+  `startDhP2pTunnel`'s readiness promise can reject while the process is
+  still running (auth rejected, timeout, etc.) — `sessionManager.js`/
+  `channelScan.js` already called `stopDhP2pTunnel` on that path, but
+  `recorder.js`'s equivalent `.catch()` only logged the error and didn't
+  stop the process, leaking a `dh-p2p` process per failed attempt. Fixed,
+  and `stopDhP2pTunnel`/the equivalent ffmpeg stop path now also escalate to
+  `SIGKILL` after a 2s grace period if `SIGTERM` doesn't take effect.
+  Verified fixed by running repeated rapid start→delete cycles (including
+  ones that hit the P2P handshake's known flakiness) and confirming zero
+  leftover `dh-p2p`/`ffmpeg` processes afterward.
+
 ## API
 
-| Method | Path                      | Body / Params                                               | Description |
-|--------|----------------------------|---------------------------------------------------------------|--------------|
-| POST   | `/api/sessions`            | `{serial, username, password, channel?, subtype?, cloud?}`    | Start a viewing session (blocks until streaming or failed) |
-| GET    | `/api/sessions/:id`        | —                                                               | Poll session status |
-| GET    | `/api/sessions/:id/log`    | —                                                               | Raw dh-p2p/ffmpeg log lines for troubleshooting |
-| DELETE | `/api/sessions/:id`        | —                                                               | Stop the session and clean up |
-| POST   | `/api/scans`               | `{serial, username, password, cloud?, maxChannels?}`           | Start a channel/stream discovery scan (returns once the tunnel is up; scanning continues in the background) |
-| GET    | `/api/scans/:id`           | —                                                               | Poll scan progress and per-channel results (thumbnails appear incrementally) |
-| GET    | `/api/scans/:id/log`       | —                                                               | Raw dh-p2p/ffmpeg log lines for the scan's tunnel |
-| POST   | `/api/scans/:id/stop`      | —                                                               | Stop an in-progress scan (keeps thumbnails already captured) |
-| DELETE | `/api/scans/:id`           | —                                                               | Stop (if running) and remove the scan, deleting its thumbnails |
+| Method | Path                                | Body / Params                                                              | Description |
+|--------|--------------------------------------|-------------------------------------------------------------------------------|--------------|
+| POST   | `/api/sessions`                      | `{serial, username, password, channel?, subtype?, cloud?}`                    | Start a viewing session (blocks until streaming or failed) |
+| GET    | `/api/sessions/:id`                  | —                                                                               | Poll session status |
+| GET    | `/api/sessions/:id/log`              | —                                                                               | Raw dh-p2p/ffmpeg log lines for troubleshooting |
+| DELETE | `/api/sessions/:id`                  | —                                                                               | Stop the session and clean up |
+| POST   | `/api/scans`                         | `{serial, username, password, cloud?, maxChannels?}`                          | Start a channel/stream discovery scan (returns once the tunnel is up; scanning continues in the background) |
+| GET    | `/api/scans/:id`                     | —                                                                               | Poll scan progress and per-channel results (thumbnails appear incrementally) |
+| GET    | `/api/scans/:id/log`                 | —                                                                               | Raw dh-p2p/ffmpeg log lines for the scan's tunnel |
+| POST   | `/api/scans/:id/stop`                | —                                                                               | Stop an in-progress scan (keeps thumbnails already captured) |
+| DELETE | `/api/scans/:id`                     | —                                                                               | Stop (if running) and remove the scan, deleting its thumbnails |
+| POST   | `/api/recordings`                    | `{serial, username, password, channel?, subtype?, cloud?, quotaGb?, segmentSeconds?}` | Start a continuous recording |
+| GET    | `/api/recordings`                    | —                                                                               | List all recordings (running or stopped) |
+| GET    | `/api/recordings/:id`                | —                                                                               | Poll a recording's status/stats |
+| GET    | `/api/recordings/:id/segments`       | —                                                                               | Raw segment list (used by the frontend to build the clickable timeline) |
+| GET    | `/api/recordings/:id/log`            | —                                                                               | Raw dh-p2p/ffmpeg log lines for the recorder's tunnel |
+| GET    | `/api/recordings/:id/playlist.m3u8`  | —                                                                               | On-the-fly HLS VOD playlist covering all currently-retained segments |
+| POST   | `/api/recordings/:id/stop`           | —                                                                               | Stop recording (keeps footage) |
+| POST   | `/api/recordings/:id/resume`         | `{username?, password?}` (required if resuming after a server restart)        | Resume a stopped recording |
+| DELETE | `/api/recordings/:id`                | —                                                                               | Stop (if running) and permanently delete the recording and its footage |
 
 ## Project layout
 
 ```
-public/            Frontend (connect form, hls.js video player, channel/stream gallery)
+public/            Frontend (connect form, hls.js video player, channel/stream gallery, recording controls + timeline)
 server/
   index.js          Express app + route wiring
   sessionManager.js  Single live-view session lifecycle (dh-p2p + ffmpeg -> HLS)
   channelScan.js     Channel/stream discovery scan lifecycle (dh-p2p + per-frame ffmpeg captures)
-  dhTunnel.js        Shared dh-p2p --relay process spawn/readiness logic (used by both of the above)
+  recorder.js        Continuous loop-recording lifecycle (dh-p2p + ffmpeg -> rolling .ts segments, quota enforcement, on-the-fly VOD playlist)
+  dhTunnel.js        Shared dh-p2p --relay process spawn/readiness logic (used by all three of the above)
   rtsp.js            Shared RTSP URL builder
   ports.js           Free local TCP port picker for the dh-p2p RTSP proxy
+  dataDir.js         Resolves a real on-disk working directory (see "Continuous (loop) recording" above for why this isn't os.tmpdir())
 scripts/            Build helper for the vendored Rust binary
 vendor/dh-p2p/      Vendored MIT-licensed dh-p2p Rust source (patched, see above)
+deploy/dahua-viewer.service  Reference systemd unit (see note on PrivateTmp/ReadWritePaths above)
 ```

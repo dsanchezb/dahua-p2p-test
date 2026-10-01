@@ -103,6 +103,61 @@
         </div>
       </details>
     </section>
+
+    <section class="panel recordings-panel">
+      <h2>Continuous (Loop) Recording</h2>
+      <p class="hint">
+        Records a channel/stream continuously in the background on the server &mdash;
+        it keeps running whether or not this page is open, and automatically deletes the
+        oldest footage to stay within the space you set below. Uses its own P2P tunnel,
+        separate from the live view and channel discovery above.
+      </p>
+
+      <form id="record-form" class="row record-form">
+        <label>
+          Channel
+          <input type="number" id="record-channel" value="1" min="1" />
+        </label>
+        <label>
+          Subtype
+          <select id="record-subtype">
+            <option value="0">0 (main stream)</option>
+            <option value="1">1 (sub stream)</option>
+          </select>
+        </label>
+        <label>
+          Space to use (GB)
+          <input type="number" id="record-quota" value="1" min="0.1" max="15" step="0.1" />
+        </label>
+        <label>
+          Segment length (s)
+          <input type="number" id="record-segment-seconds" value="60" min="5" max="300" />
+        </label>
+        <button type="submit" id="record-start-btn">Start Recording</button>
+      </form>
+      <p class="hint">
+        Uses the Device Serial / Username / Password from the Connect panel above.
+      </p>
+
+      <div id="recordings-list" class="recordings-list"></div>
+
+      <div id="playback-panel" class="playback-panel" hidden>
+        <h3 id="playback-title">Playback</h3>
+        <video id="playback-video" controls playsinline></video>
+        <div class="timeline-wrap">
+          <div id="timeline" class="timeline">
+            <div id="timeline-played" class="timeline-played"></div>
+            <div id="timeline-gaps"></div>
+            <div id="timeline-cursor" class="timeline-cursor" hidden></div>
+          </div>
+          <div class="timeline-labels">
+            <span id="timeline-start-label">&ndash;</span>
+            <span id="timeline-end-label">&ndash;</span>
+          </div>
+        </div>
+        <p class="hint">Click anywhere on the bar to jump to that point in the recording.</p>
+      </div>
+    </section>
   </main>
 
   <footer>

@@ -2,3 +2,4 @@ node_modules/
 vendor/dh-p2p/target/
 *.log
 .DS_Store
+/var/
