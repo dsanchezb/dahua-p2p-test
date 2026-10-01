@@ -7,16 +7,10 @@ const os = require('os');
 const crypto = require('crypto');
 
 const { findFreePort } = require('./ports');
+const { startDhP2pTunnel, stopDhP2pTunnel } = require('./dhTunnel');
+const { buildRtspUrl } = require('./rtsp');
 
-const DH_P2P_BIN = path.join(__dirname, '..', 'vendor', 'dh-p2p', 'target', 'release', 'dh-p2p');
 const HLS_ROOT = path.join(os.tmpdir(), 'dahua-p2p-hls');
-
-const READY_TIMEOUT_MS = 25_000;
-const READY_MARKER = 'Ready to connect';
-const AUTH_FAIL_MARKERS = [
-  'requires authentication',
-  'Error response: 403 Forbidden',
-];
 
 fs.mkdirSync(HLS_ROOT, { recursive: true });
 
@@ -69,103 +63,31 @@ function setStatus(session, status, error) {
 }
 
 /**
- * Starts a dh-p2p relay-mode subprocess for the given serial, waiting for it
- * to report readiness (a local RTSP proxy listening on rtspPort).
+ * Starts a dh-p2p relay-mode tunnel for the session's serial, waiting for it
+ * to report readiness (a local RTSP proxy listening on session.rtspPort).
+ * Also wires a post-ready exit handler so a tunnel that dies mid-stream
+ * flips the session into an error state instead of silently going stale.
  */
 function startDhP2p(session) {
-  return new Promise((resolve, reject) => {
-    if (!fs.existsSync(DH_P2P_BIN)) {
-      reject(new Error(
-        `dh-p2p binary not found at ${DH_P2P_BIN}. Run "npm run build:dhp2p" first.`
-      ));
-      return;
-    }
+  const { proc, ready } = startDhP2pTunnel({
+    serial: session.serial,
+    cloud: session.cloud,
+    rtspPort: session.rtspPort,
+    onLog: (source, line) => session.appendLog(source, line),
+  });
 
-    const args = ['--relay', '-p', `127.0.0.1:${session.rtspPort}:554`];
-    if (session.cloud && session.cloud !== 'easy4ip') {
-      // Note: the vendored Rust CLI does not currently expose --cloud; this
-      // is reserved for when/if upstream adds it. easy4ip is the default and
-      // covers Dahua/derived devices; Amcrest devices are out of scope here.
-      session.appendLog('dh-p2p', `warning: cloud override "${session.cloud}" requested but the Rust binary only supports easy4ip; continuing with easy4ip.`);
-    }
-    args.push(session.serial);
+  session.dhProc = proc;
 
-    const proc = spawn(DH_P2P_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    session.dhProc = proc;
-    if (process.env.DHP2P_DEBUG) {
-      // eslint-disable-next-line no-console
-      console.error(`[debug] spawned dh-p2p pid=${proc.pid} args=${JSON.stringify(args)}`);
-    }
-
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        reject(new Error('Timed out waiting for the P2P tunnel to reach the device (no response after 25s). The device may be offline, the serial may be wrong, or it may not be reachable through this relay.'));
-      }
-    }, READY_TIMEOUT_MS);
-
-    const onData = (source) => (chunk) => {
-      const text = chunk.toString('utf8');
-      for (const line of text.split(/\r?\n/)) {
-        if (!line) continue;
-        session.appendLog(source, line);
-        if (process.env.DHP2P_DEBUG) {
-          // eslint-disable-next-line no-console
-          console.error(`[debug:${source}] ${line}`);
-        }
-
-        if (!settled) {
-          if (line.includes(READY_MARKER)) {
-            settled = true;
-            clearTimeout(timer);
-            resolve();
-          } else if (AUTH_FAIL_MARKERS.some((m) => line.includes(m))) {
-            settled = true;
-            clearTimeout(timer);
-            reject(new Error(`Device rejected the P2P channel setup: ${line.trim()}`));
-          } else if (/^Error:/.test(line.trim())) {
-            settled = true;
-            clearTimeout(timer);
-            reject(new Error(line.trim()));
-          }
-        }
-      }
-    };
-
-    proc.stdout.on('data', onData('dh-p2p'));
-    proc.stderr.on('data', onData('dh-p2p:err'));
-
-    proc.on('error', (err) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        reject(err);
-      }
-    });
-
-    proc.on('exit', (code, signal) => {
-      session.appendLog('dh-p2p', `process exited (code=${code}, signal=${signal})`);
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        reject(new Error(`dh-p2p exited before the tunnel was ready (code=${code}, signal=${signal})`));
-      }
-      // If the tunnel dies mid-stream, reflect that in status.
+  if (proc) {
+    proc.on('exit', () => {
       if (session.status === 'streaming' || session.status === 'tunnel_ready') {
         setStatus(session, 'error', 'The P2P tunnel to the device closed unexpectedly.');
         stopFfmpeg(session);
       }
     });
-  });
-}
+  }
 
-function buildRtspUrl(session) {
-  const user = encodeURIComponent(session.username);
-  const pass = encodeURIComponent(session.password);
-  const channel = encodeURIComponent(session.channel);
-  const subtype = encodeURIComponent(session.subtype);
-  return `rtsp://${user}:${pass}@127.0.0.1:${session.rtspPort}/cam/realmonitor?channel=${channel}&subtype=${subtype}`;
+  return ready;
 }
 
 /**
@@ -175,7 +97,13 @@ function buildRtspUrl(session) {
 function startFfmpeg(session) {
   fs.mkdirSync(session.hlsDir, { recursive: true });
   const playlistPath = path.join(session.hlsDir, 'index.m3u8');
-  const rtspUrl = buildRtspUrl(session);
+  const rtspUrl = buildRtspUrl({
+    username: session.username,
+    password: session.password,
+    rtspPort: session.rtspPort,
+    channel: session.channel,
+    subtype: session.subtype,
+  });
 
   const args = [
     '-rtsp_transport', 'tcp',
@@ -256,12 +184,6 @@ function stopFfmpeg(session) {
   }
 }
 
-function stopDhP2p(session) {
-  if (session.dhProc && !session.dhProc.killed) {
-    session.dhProc.kill('SIGTERM');
-  }
-}
-
 function cleanupHlsDir(session) {
   fs.rm(session.hlsDir, { recursive: true, force: true }, () => {});
 }
@@ -282,7 +204,7 @@ async function createSession(params) {
   } catch (err) {
     setStatus(session, 'error', err.message || String(err));
     stopFfmpeg(session);
-    stopDhP2p(session);
+    stopDhP2pTunnel(session.dhProc);
   }
 
   return session;
@@ -296,7 +218,7 @@ function stopSession(id) {
   const session = sessions.get(id);
   if (!session) return false;
   stopFfmpeg(session);
-  stopDhP2p(session);
+  stopDhP2pTunnel(session.dhProc);
   setStatus(session, 'stopped');
   cleanupHlsDir(session);
   sessions.delete(id);
@@ -310,9 +232,6 @@ function stopAllSessions() {
     stopSession(id);
   }
 }
-
-process.on('SIGINT', () => { stopAllSessions(); process.exit(0); });
-process.on('SIGTERM', () => { stopAllSessions(); process.exit(0); });
 
 module.exports = {
   createSession,

@@ -67,6 +67,42 @@
       <h2>Session Log</h2>
       <pre id="log"></pre>
     </section>
+
+    <section class="panel channels-panel">
+      <details id="channels-details">
+        <summary>
+          <h2 class="channels-summary-title">Discover Channels &amp; Streams</h2>
+          <span class="channels-summary-hint">Click to expand</span>
+        </summary>
+
+        <div class="channels-body">
+          <p class="hint">
+            Probes channels 1&ndash;N on this device (using the same serial/username/password
+            above) and captures a thumbnail from whichever channel/stream combination responds.
+            Useful for NVRs where you don't already know how many cameras are connected or which
+            channel numbers are in use. Uses its own, separate P2P tunnel from the live view above.
+          </p>
+
+          <div class="row channels-controls">
+            <label>
+              Max channels to probe
+              <input type="number" id="scan-max-channels" value="16" min="1" max="64" />
+            </label>
+            <div class="channels-buttons">
+              <button type="button" id="scan-start-btn">Discover Channels</button>
+              <button type="button" id="scan-stop-btn" disabled>Stop Scan</button>
+            </div>
+          </div>
+
+          <div id="scan-status" class="status status-idle">Not scanned yet</div>
+          <div id="scan-progress" class="scan-progress" hidden>
+            <div id="scan-progress-bar" class="scan-progress-bar"></div>
+          </div>
+
+          <div id="channel-grid" class="channel-grid"></div>
+        </div>
+      </details>
+    </section>
   </main>
 
   <footer>

@@ -170,20 +170,68 @@ authenticates successfully stays up indefinitely (tested continuously for
 - The relay path adds latency and depends on Dahua's relay/agent
   infrastructure being up.
 
+## Channel/stream discovery
+
+Many devices served through this protocol are NVRs where you may not know in
+advance how many cameras are connected, which channel numbers are in use, or
+whether a given channel exposes a sub-stream. The **"Discover Channels &
+Streams"** expandable section on the page probes this for you:
+
+1. It brings up a single P2P/PTCP tunnel for the device (separate from any
+   live-view tunnel you may also have open) via `dh-p2p --relay`.
+2. Over that one tunnel, it walks channels `1..maxChannels` (16 by default,
+   Dahua's common NVR ceiling) and, for each, asks `ffmpeg` to pull exactly
+   one frame from both `subtype=0` (main stream) and `subtype=1` (sub
+   stream), saving whichever succeeds as a small JPEG thumbnail.
+3. Channels are shown in the UI as soon as each one finishes — you don't have
+   to wait for the whole scan. Clicking a thumbnail copies that
+   channel/subtype into the live-view form above and starts watching it.
+4. As a time-saver, the scan stops early once it sees several consecutive
+   channels with no stream on either subtype (configurable via
+   `CONSECUTIVE_EMPTY_TO_STOP` / `MIN_BEFORE_EARLY_STOP` in
+   `server/channelScan.js`), rather than always walking all the way to
+   `maxChannels`.
+
+This was tested end-to-end against the real device used throughout this
+project's testing (serial `5H0989EPAZEB886`): a 4-channel scan correctly
+found all 4 channels, both subtypes available on each, with real,
+non-trivial JPEG thumbnails (visually confirmed to show actual camera
+footage, not blank/black frames). A mid-scan "Stop Scan" was also exercised
+and correctly halted the probe loop and tore down the tunnel while keeping
+the thumbnails already captured.
+
+Each channel/stream probe is just a single-frame `ffmpeg` capture, so it's
+subject to the same underlying P2P/PTCP tunnel flakiness documented above —
+an individual channel occasionally reports "no stream" simply because that
+one RTSP connection attempt didn't land, not because the channel doesn't
+exist. Re-running the scan is the simplest way to confirm a channel marked
+unavailable is actually unavailable.
+
 ## API
 
-| Method | Path                    | Body / Params                                             | Description |
-|--------|--------------------------|------------------------------------------------------------|--------------|
-| POST   | `/api/sessions`          | `{serial, username, password, channel?, subtype?, cloud?}` | Start a viewing session (blocks until streaming or failed) |
-| GET    | `/api/sessions/:id`      | —                                                            | Poll session status |
-| GET    | `/api/sessions/:id/log`  | —                                                            | Raw dh-p2p/ffmpeg log lines for troubleshooting |
-| DELETE | `/api/sessions/:id`      | —                                                            | Stop the session and clean up |
+| Method | Path                      | Body / Params                                               | Description |
+|--------|----------------------------|---------------------------------------------------------------|--------------|
+| POST   | `/api/sessions`            | `{serial, username, password, channel?, subtype?, cloud?}`    | Start a viewing session (blocks until streaming or failed) |
+| GET    | `/api/sessions/:id`        | —                                                               | Poll session status |
+| GET    | `/api/sessions/:id/log`    | —                                                               | Raw dh-p2p/ffmpeg log lines for troubleshooting |
+| DELETE | `/api/sessions/:id`        | —                                                               | Stop the session and clean up |
+| POST   | `/api/scans`               | `{serial, username, password, cloud?, maxChannels?}`           | Start a channel/stream discovery scan (returns once the tunnel is up; scanning continues in the background) |
+| GET    | `/api/scans/:id`           | —                                                               | Poll scan progress and per-channel results (thumbnails appear incrementally) |
+| GET    | `/api/scans/:id/log`       | —                                                               | Raw dh-p2p/ffmpeg log lines for the scan's tunnel |
+| POST   | `/api/scans/:id/stop`      | —                                                               | Stop an in-progress scan (keeps thumbnails already captured) |
+| DELETE | `/api/scans/:id`           | —                                                               | Stop (if running) and remove the scan, deleting its thumbnails |
 
 ## Project layout
 
 ```
-public/            Frontend (form + hls.js video player)
-server/             Express backend + session orchestration
+public/            Frontend (connect form, hls.js video player, channel/stream gallery)
+server/
+  index.js          Express app + route wiring
+  sessionManager.js  Single live-view session lifecycle (dh-p2p + ffmpeg -> HLS)
+  channelScan.js     Channel/stream discovery scan lifecycle (dh-p2p + per-frame ffmpeg captures)
+  dhTunnel.js        Shared dh-p2p --relay process spawn/readiness logic (used by both of the above)
+  rtsp.js            Shared RTSP URL builder
+  ports.js           Free local TCP port picker for the dh-p2p RTSP proxy
 scripts/            Build helper for the vendored Rust binary
-vendor/dh-p2p/      Vendored MIT-licensed dh-p2p Rust source (unmodified)
+vendor/dh-p2p/      Vendored MIT-licensed dh-p2p Rust source (patched, see above)
 ```
